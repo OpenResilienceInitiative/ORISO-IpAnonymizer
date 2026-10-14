@@ -1,0 +1,164 @@
+name: Release IP Anonymizer Image
+
+# Pushing release/ip-anonymizer-<version> (e.g. release/ip-anonymizer-2.0.12)
+# validates, scans, publishes ghcr.io/openresilienceinitiative/ip-anonymizer:<version>,
+# tags v<version> and creates the GitHub release. The version follows the ORISO
+# platform release in which the image changed (as all ORISO images do).
+on:
+  push:
+    branches:
+      - "release/ip-anonymizer-*"
+
+env:
+  REGISTRY: ghcr.io
+  ORG: openresilienceinitiative
+  IMAGE_NAME: ip-anonymizer
+  RELEASE_PREFIX: release/ip-anonymizer-
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  packages: write
+
+jobs:
+  release:
+    name: validate, tag and publish the ip-anonymizer image
+    if: ${{ github.event.deleted == false }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout release branch
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release branch and image tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH="${GITHUB_REF_NAME}"
+          VERSION="${BRANCH#${RELEASE_PREFIX}}"
+
+          if [[ "${BRANCH}" == "${VERSION}" ]]; then
+            echo "::error::Release branch must match ${RELEASE_PREFIX}<version>, for example ${RELEASE_PREFIX}2.0.12"
+            exit 1
+          fi
+
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release version must be semantic version format, for example 2.0.12"
+            exit 1
+          fi
+
+          if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag v${VERSION} already exists. Choose a new version."
+            exit 1
+          fi
+
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "IMAGE=${REGISTRY}/${ORG}/${IMAGE_NAME}:${VERSION}" >> "${GITHUB_ENV}"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Validate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(gofmt -l .)" || { echo "::error::Source is not gofmt-formatted"; exit 1; }
+          go vet ./...
+          go test ./...
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Warn when overwriting an existing image tag
+        shell: bash
+        run: |
+          if docker buildx imagetools inspect "${IMAGE}" >/dev/null 2>&1; then
+            echo "::warning::Image tag ${IMAGE} already exists and will be overwritten by this release rerun."
+          fi
+
+      # Scan before publishing, not after: a release tag is what an operator is
+      # invited to trust. linux/amd64 only, because `docker load` cannot take a
+      # multi-platform manifest; the publishing build reuses the gha cache.
+      - name: Build the image for scanning
+        id: scan_build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ip-anonymizer-release-scan:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Reject fixable vulnerabilities before publishing
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.scan_build.outputs.imageid }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: CRITICAL,HIGH
+
+      - name: Build and push image
+        id: image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sign and publish provenance
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.1.0
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.ORG }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Create and push release tag
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${VERSION}" -m "Release IP Anonymizer image v${VERSION}"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "v${VERSION}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          name: IP Anonymizer v${{ env.VERSION }}
+          generate_release_notes: true
+          body: |
+            Docker image:
+            `${{ env.IMAGE }}`
+
+            Source branch:
+            `${{ github.ref_name }}`
