@@ -1,0 +1,46 @@
+name: CI - Feature Branch
+
+# Everything except the permanent branches; those run ci-main.yml, which also
+# publishes. A feature branch is validated, never published.
+on:
+  push:
+    branches-ignore:
+      - main
+      - dev
+      - pre-dev
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: format, vet, build, test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            echo "::error::Not gofmt-formatted: ${unformatted}"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./...
