@@ -1,0 +1,110 @@
+name: Build, scan and optionally publish the IpAnonymizer image
+description: Scan both OCI manifests before publishing the same image.
+
+inputs:
+  push_to_ghcr:
+    description: Whether to publish the scanned archive to GHCR
+    required: true
+  github_token:
+    description: GitHub token used when publishing is enabled
+    required: false
+    default: ''
+  release_tag:
+    description: Full versioned image tag for a release build
+    required: false
+    default: ''
+  release_version:
+    description: Version to add to the release image labels
+    required: false
+    default: ''
+
+outputs:
+  digest:
+    description: Immutable digest of the scanned and published image
+    value: ${{ steps.publish.outputs.digest }}
+
+runs:
+  using: composite
+  steps:
+  - name: Set up Docker Buildx
+    uses: docker/setup-buildx-action@v4
+
+  - name: Docker metadata
+    id: meta
+    if: ${{ inputs.push_to_ghcr == 'true' && inputs.release_tag == '' }}
+    uses: docker/metadata-action@v5
+    with:
+      images: ${{ env.REGISTRY }}/${{ env.ORG }}/${{ env.IMAGE_NAME }}
+      tags: |
+        type=sha
+        type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+        type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+        type=raw,value=pre-dev,enable=${{ github.ref == 'refs/heads/pre-dev' }}
+
+  - name: Build the complete image without publishing
+    id: build
+    uses: docker/build-push-action@v7
+    with:
+      context: .
+      platforms: linux/amd64,linux/arm64
+      push: false
+      outputs: type=oci,dest=${{ runner.temp }}/ip-anonymizer.tar
+      provenance: mode=max
+      sbom: true
+      labels: |
+        org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+        org.opencontainers.image.revision=${{ github.sha }}
+        ${{ inputs.release_version != '' && format('org.opencontainers.image.version={0}', inputs.release_version) || '' }}
+      cache-from: type=gha
+      cache-to: type=gha,mode=max
+
+  - name: Install OCI transport
+    shell: bash
+    run: |
+      if ! command -v skopeo >/dev/null; then
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends skopeo
+      fi
+
+  - name: Install Trivy
+    uses: aquasecurity/setup-trivy@3fb12ec12f41e471780db15c232d5dd185dcb514 # v0.2.6
+    with:
+      version: v0.70.0
+      cache: true
+
+  - name: Reject fixable high or critical vulnerabilities on both platforms
+    id: scan
+    shell: bash
+    env:
+      IMAGE_ARCHIVE: ${{ runner.temp }}/ip-anonymizer.tar
+      EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
+    run: bash scripts/ci/scan-image-archive.sh "$IMAGE_ARCHIVE" linux/amd64,linux/arm64 "$EXPECTED_DIGEST"
+
+  - name: Login to GHCR
+    if: ${{ inputs.push_to_ghcr == 'true' }}
+    uses: docker/login-action@v4
+    with:
+      registry: ${{ env.REGISTRY }}
+      username: ${{ github.actor }}
+      password: ${{ inputs.github_token }}
+
+  - name: Warn when overwriting an existing image tag
+    if: ${{ inputs.push_to_ghcr == 'true' && inputs.release_tag != '' }}
+    shell: bash
+    env:
+      IMAGE: ${{ inputs.release_tag }}
+    run: |
+      if docker buildx imagetools inspect "${IMAGE}" >/dev/null 2>&1; then
+        echo "::warning::Image tag ${IMAGE} already exists and will be overwritten by this release rerun."
+      fi
+
+  - name: Publish the scanned archive without rebuilding
+    id: publish
+    if: ${{ inputs.push_to_ghcr == 'true' }}
+    shell: bash
+    env:
+      IMAGE_ARCHIVE: ${{ runner.temp }}/ip-anonymizer.tar
+      IMAGE_TAGS: ${{ inputs.release_tag || steps.meta.outputs.tags }}
+      EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
+      EXPECTED_ARCHIVE_SHA256: ${{ steps.scan.outputs.archive_sha256 }}
+    run: bash scripts/ci/publish-image-archive.sh "$IMAGE_ARCHIVE" "$EXPECTED_DIGEST" "$EXPECTED_ARCHIVE_SHA256"
