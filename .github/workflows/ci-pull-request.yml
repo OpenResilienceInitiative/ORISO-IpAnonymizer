@@ -49,28 +49,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      - name: Verify the OCI archive workflow and failure handling
+        run: bash scripts/ci/test-image-archive.sh
 
-      - name: Build image for scanning
-        id: scan_build
-        uses: docker/build-push-action@v7
+      - name: Build and scan without publishing
+        uses: ./.github/actions/docker-build-push
         with:
-          context: .
-          platforms: linux/amd64
-          push: false
-          load: true
-          tags: ip-anonymizer-pr-scan:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # Same gate as the release: fixable CRITICAL/HIGH findings fail the PR.
-      - name: Reject fixable vulnerabilities
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ steps.scan_build.outputs.imageid }}
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
+          push_to_ghcr: false
