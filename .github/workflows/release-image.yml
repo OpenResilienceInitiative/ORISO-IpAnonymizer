@@ -73,64 +73,14 @@ jobs:
           go vet ./...
           go test ./...
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Login to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Warn when overwriting an existing image tag
-        shell: bash
-        run: |
-          if docker buildx imagetools inspect "${IMAGE}" >/dev/null 2>&1; then
-            echo "::warning::Image tag ${IMAGE} already exists and will be overwritten by this release rerun."
-          fi
-
-      # Scan before publishing, not after: a release tag is what an operator is
-      # invited to trust. linux/amd64 only, because `docker load` cannot take a
-      # multi-platform manifest; the publishing build reuses the gha cache.
-      - name: Build the image for scanning
-        id: scan_build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64
-          push: false
-          load: true
-          tags: ip-anonymizer-release-scan:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Reject fixable vulnerabilities before publishing
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ steps.scan_build.outputs.imageid }}
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
-
-      - name: Build and push image
+      - name: Build, scan and publish the versioned image
         id: image
-        uses: docker/build-push-action@v7
+        uses: ./.github/actions/docker-build-push
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          provenance: mode=max
-          sbom: true
-          tags: ${{ env.IMAGE }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ env.VERSION }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          push_to_ghcr: true
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          release_tag: ${{ env.IMAGE }}
+          release_version: ${{ env.VERSION }}
 
       - name: Sign and publish provenance
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.1.0

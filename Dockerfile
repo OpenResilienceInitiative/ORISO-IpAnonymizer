@@ -1,7 +1,7 @@
 # Static, stdlib-only binary on scratch: no shell, no package manager, non-root.
-# Base images are pinned by digest. 1.26.9 fixes stdlib CVE-2026-78667,
-# CVE-2026-78669 (net/http) and CVE-2026-97031 (crypto/tls).
-FROM --platform=${BUILDPLATFORM} golang:1.26.10-alpine@sha256:5cb67f19c5e7994dcb80c074f7cfca8aeeada45bbdca035f73df269cefdcce61 AS builder
+# The pinned compiler supplies the standard library shipped in the binary.
+# Go 1.26.11 fixes CVE-2026-97054, which the image gate reports on 1.26.10.
+FROM --platform=${BUILDPLATFORM} golang:1.26.11-alpine@sha256:ecb67f987aa1a57794c91d19ade7ae0209f2f0f5496aaef9e6ae85ddf92d02ab AS builder
 ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod ./
