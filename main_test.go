@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -118,5 +120,55 @@ func TestSessionKeyConfigurationRequires32BytesOfBase64(t *testing.T) {
 		if _, err := parseSessionKey(invalid); err == nil {
 			t.Fatal("invalid shared keys must be rejected")
 		}
+	}
+}
+
+func TestStopKeepsServingForTheDrainDelayThenShutsDown(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	url := "http://" + listener.Addr().String() + "/auth"
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: time.Second}
+	get := func() error {
+		response, err := client.Get(url)
+		if err != nil {
+			return err
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK || response.Header.Get("X-Anon-Id") == "" {
+			t.Fatalf("/auth returned %d without an anonymous ID", response.StatusCode)
+		}
+		return nil
+	}
+
+	const delay = 300 * time.Millisecond
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- serve(ctx, &http.Server{Handler: newHandler(sessionKey{1}, time.Now)}, listener, delay)
+	}()
+	if err := get(); err != nil {
+		t.Fatalf("/auth before the stop signal: %v", err)
+	}
+
+	stopped := time.Now()
+	stop()
+	if err := get(); err != nil {
+		t.Fatalf("a new connection during the drain delay must still be answered: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve returned %v, want a clean shutdown", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not shut down after the drain delay")
+	}
+	if elapsed := time.Since(stopped); elapsed < delay {
+		t.Fatalf("serve stopped after %v, before the %v drain delay", elapsed, delay)
+	}
+	if err := get(); err == nil {
+		t.Fatal("/auth still answered after shutdown")
 	}
 }
