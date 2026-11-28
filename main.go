@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -8,9 +9,20 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
+)
+
+// drainDelay keeps a stopping pod answering while Kubernetes removes it from the
+// Service endpoints; shutdownTimeout bounds the wait for requests in flight.
+// Together they stay inside the default 30s termination grace period.
+const (
+	drainDelay      = 5 * time.Second
+	shutdownTimeout = 10 * time.Second
 )
 
 const (
@@ -102,10 +114,35 @@ func newHandler(key sessionKey, clock func() time.Time) http.Handler {
 	return mux
 }
 
+// serve runs server until ctx is cancelled, then keeps serving for delay before
+// shutting down: endpoint removal lags SIGTERM, and every ingress request waits
+// on /auth, so exiting at once fails requests that are still routed here.
+func serve(ctx context.Context, server *http.Server, listener net.Listener, delay time.Duration) error {
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(listener) }()
+	select {
+	case err := <-served:
+		return err
+	case <-ctx.Done():
+	}
+	time.Sleep(delay)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	return server.Shutdown(shutdownCtx)
+}
+
 func main() {
 	key, err := parseSessionKey(os.Getenv("ANON_SESSION_KEY"))
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Fatal(http.ListenAndServe(":8080", newHandler(key, time.Now)))
+	listener, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	if err := serve(ctx, &http.Server{Handler: newHandler(key, time.Now)}, listener, drainDelay); err != nil {
+		log.Fatal(err)
+	}
 }
